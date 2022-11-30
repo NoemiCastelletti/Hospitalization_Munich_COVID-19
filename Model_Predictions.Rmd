@@ -1,0 +1,902 @@
+---
+title: "Model Prediction"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r,warning=FALSE,message=FALSE,error=FALSE}
+
+#Loading all necessary libraries
+
+library(deSolve)
+library(ggplot2)
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(MASS)
+library(plyr)
+library(readr)
+library(tidyverse)
+library(ggpubr)
+
+mytheme <- theme(
+  plot.title = element_text(size=18),
+  axis.title = element_text(size=16), 
+  axis.text = element_text(size=16),
+  legend.title = element_text(size=16),
+  legend.text = element_text(size=16),
+  panel.background = element_rect(fill = "white",colour = "black", size = 0.3),
+  panel.grid.major = element_line(linetype = 'solid',colour = "grey90",size=0.35),
+  panel.grid.minor = element_line(linetype = 'solid',colour = "grey90",size=0.35)
+)
+
+
+```
+
+
+# RKI Data
+
+```{r,warning=FALSE,message=FALSE,error=FALSE}
+#Preparing the RKI data set
+
+covid <- fread("RKI_COVID19_final.csv")
+covid_Munich <- covid[Bundesland=="Bayern"&Landkreis=="SK MÃ¼nchen",]
+covid_Munich <- separate(data=covid_Munich, col=Meldedatum,
+                         into=c("Meldedatum","Meldezeit"),sep=" ")
+covid_Munich <- covid_Munich[,c("AnzahlFall","AnzahlTodesfall","NeuerTodesfall",
+                                "AnzahlGenesen","NeuGenesen","Meldedatum")]
+
+dt <- data.table()
+# Calculating the daily detected cases
+dt$Meldedatum <- covid_Munich[,sum(AnzahlFall),by=Meldedatum][,1]
+dt$AnzahlFall <- covid_Munich[,sum(AnzahlFall),by=Meldedatum][,2]
+dt$AnzahlGenesen <- covid_Munich[,sum(AnzahlGenesen),by=Meldedatum][,2]
+dt$AnzahlTodesfall <- covid_Munich[,sum(AnzahlTodesfall),by=Meldedatum][,2]
+dt <- dt[order(as.Date(dt$Meldedatum, format="%Y/%m/%d")),]
+
+dt_first <- dt[1:107,]
+dt_second <- dt[107:350,]
+dt_third <- dt[350:485,]
+dt_fourth <- dt[485:length(dt$Meldedatum),]
+
+# Calculation of days that have passed since the first detected case in Munich (2020/01/29)
+d1 <- as.Date(dt$Meldedatum)
+d2 <- c(as.Date(dt[1,Meldedatum]), as.Date(dt[1:length(Meldedatum)-1,Meldedatum]))
+dt$time <- cumsum(as.numeric(d1-d2))
+
+rm(d1,d2,covid,covid_Munich,dt_first, dt_second)
+
+dt_all <- dt[1:592,]
+
+dt <- dt[1:485,]
+
+N <- 1488202 #Munich Population
+
+```
+
+
+
+```{r,warning=FALSE,message=FALSE,error=FALSE}
+
+out_1 <- fread("out_1.csv")
+out_2 <- fread("out_2.csv")
+out_3 <- fread("out_3.csv")
+
+```
+
+
+
+```{r,warning=FALSE,message=FALSE,error=FALSE}
+
+#dt_third
+# Calculation of days that have passed since the first detected case in Munich (2020/01/29)
+d1 <- as.Date(dt_third$Meldedatum)
+d2 <- c(as.Date(dt_third[1,Meldedatum]), as.Date(dt_third[1:length(Meldedatum)-1,Meldedatum]))
+dt_third$time <- cumsum(as.numeric(d1-d2))
+
+#dt_fourth
+d1 <- as.Date(dt_fourth$Meldedatum)
+d2 <- c(as.Date(dt_fourth[1,Meldedatum]), as.Date(dt_fourth[1:length(Meldedatum)-1,Meldedatum]))
+dt_fourth$time <- cumsum(as.numeric(d1-d2))
+dt_fourth <- dt_fourth[1:108]
+
+#dt_vacc
+dt_vacc <- fread("Impfstatistik_stadtportal.csv")
+d1 <- as.Date(dt_vacc$Datum)
+d2 <- c(as.Date(dt_vacc[1,Datum]), as.Date(dt_vacc[1:length(Datum)-1,Datum]))
+dt_vacc$time <- cumsum(as.numeric(d1-d2))
+dt_vacc$time <- dt_vacc$time+rep(43,length(dt_vacc$time))
+dt_vacc$vacc_1 <- dt_vacc[,Erstimpfung-Zweitimpfung]
+dt_vacc$vacc_2 <- dt_vacc[,Zweitimpfung]
+
+#dt_vacc_fourth
+dt_vacc_fourth <- fread("Impfstatistik_stadtportal - ergänzt.csv")
+dt_vacc_fourth <- dt_vacc_fourth[95:171,]
+d1 <- as.Date(dt_vacc_fourth$Datum)
+d2 <- c(as.Date(dt_vacc_fourth[1,Datum]), as.Date(dt_vacc_fourth[1:length(Datum)-1,Datum]))
+dt_vacc_fourth$time <- cumsum(as.numeric(d1-d2))
+dt_vacc_fourth$time <- dt_vacc_fourth$time#+rep(43,length(dt_vacc_fourth$time))
+dt_vacc_fourth$vacc_1 <- dt_vacc_fourth[,Erstimpfung-Zweitimpfung]
+dt_vacc_fourth$vacc_2 <- dt_vacc_fourth[,Zweitimpfung]
+
+
+rm(d1,d2)
+
+```
+
+
+
+
+# First Fitting
+
+```{r,warning=FALSE,message=FALSE,error=FALSE}
+
+#Preferred Model with Vaccinations
+intervention_period <- c(31,93)
+contact_reduction <- c(0.6,0.7,0.75)
+
+
+delta <- dt_fourth[,sum(AnzahlTodesfall)]/dt_fourth[,sum(AnzahlFall)]
+eta_0 <- 0.25
+eta_1 <- 0.9
+gamma_pos <- 0.1661059
+beta0 <- 1.305984   #0.81624030*1.6
+
+
+#Defining the model without vaccination
+model <-function(t, x, params){
+  ## first define state variables
+  S <- x[1]
+  E <- x[2]
+  I_a <- x[3]
+  I_p <- x[4]
+  I_s <- x[5]
+  P <- x[6]
+  R <- x[7]
+  D <- x[8]
+  R_u <- x[9]
+  V1 <- x[10]
+  V2 <- x[11]
+  ## now define parameters
+  sigma_1 <- params["sigma_1"]
+  contact_reduction_2 <- params["contact_reduction_2"]
+  contact_reduction_3 <- params["contact_reduction_3"]
+  v_1_1 <- params["v_1_1"]
+  v_1_2 <- params["v_1_2"]
+  v_2_1 <- params["v_2_1"]
+  v_2_2 <- params["v_2_2"]
+  ## Reduce contact rate over time because of interventions
+  sigma_1_t <- if_else(t <= 7,
+                       0.25,
+                       sigma_1)
+  beta_t <- if_else(t <= intervention_period[1],
+                    beta0 * contact_reduction[1],
+                    if_else(t <= intervention_period[2],
+                    beta0 * contact_reduction_2,
+                    beta0 *contact_reduction_3))
+  v_1_t <- if_else(t <= 75,
+                   v_1_1,
+                   v_1_2)
+  v_2_t <- if_else(t <= 50,
+                   v_2_1,
+                   v_2_2)
+  ## now code the model equations
+  dSdt <- -((beta_t*x[3]+beta_t*x[4]+0.6*beta_t*x[5]+0.1*beta_t*x[6])/(N-x[8]))*x[1]-
+    v_1_t*x[1]
+  dEdt <- ((beta_t*x[3]+beta_t*x[4]+0.6*beta_t*x[5]+0.1*beta_t*x[6])/(N-x[8]))*x[1]+
+    sigma_1_t*((beta_t*x[3]+beta_t*x[4]+0.6*beta_t*x[5]+0.1*beta_t*x[6])/(N-x[8]))*x[10]-
+    (1/5.5)*x[2]
+  dI_adt <- (1-0.69)*(1/5.5)*x[2]-(1/6)*x[3]
+  dI_pdt <- 0.69*(1/5.5)*x[2]-(1/2)*x[4]
+  dI_sdt <- (1-eta_0)*(1/2)*x[4]-(1/7)*x[5]
+  dPdt <- eta_0*(1/6)*x[3]+eta_0*(1/2)*x[4]+eta_1*(1/7)*x[5]-gamma_pos*x[6]
+  dRdt <- (1-delta)*gamma_pos*x[6]
+  dDdt <- delta*gamma_pos*x[6]
+  dR_udt <- (1-eta_1)*(1/7)*x[5]+(1-eta_0)*(1/6)*x[3]
+  dV1dt <- v_1_t*x[1]-sigma_1_t*((beta_t*x[3]+beta_t*x[4]+0.6*beta_t*x[5]+0.1*beta_t*x[6])/(N-x[8]))*x[10]-
+    v_2_t*x[10]
+  dV2dt <- v_2_t*x[10]
+  list(c(dSdt,dEdt,dI_adt,dI_pdt,dI_sdt,dPdt,dRdt,dDdt,dR_udt,dV1dt,dV2dt))## return result as a list
+}
+
+
+#Defining function to optimize the parameters: Calculate sum-of-squares error
+SSE <- function(parameters){
+  names(parameters) <- c("sigma_1","contact_reduction_2","contact_reduction_3",
+                         "v_1_1","v_1_2","v_2_1","v_2_2")
+  times <-seq(from=0,to=107,by=1)# returns a sequence
+  xstart <-c(S=out_3[length(out_3$time),S], E=out_3[length(out_3$time),E],
+           I_a=out_3[length(out_3$time),I_a], I_p=out_3[length(out_3$time),I_p],
+           I_s=out_3[length(out_3$time),I_s], P=out_3[length(out_3$time),P], 
+           R=out_3[length(out_3$time),R], D=out_3[length(out_3$time),D],
+           R_u=out_3[length(out_3$time),R_u],
+           V1=out_3[length(out_3$time),V1], V2=out_3[length(out_3$time),V2])
+  out_4 <-as.data.table(
+    ode(func=model,
+        y=xstart,
+        times=times,
+        parms=parameters))
+  out_4$cases_per_day_P <- out_4[,P-c(out_3[length(out_3$time)-1,P],P[1:length(P)-1])+
+                                 (D-c(out_3[length(out_3$time)-1,D],D[1:length(D)-1]))+
+                                 (R-c(out_3[length(out_3$time)-1,R],R[1:length(R)-1]))]
+  data_model <- out_4[,c("time","cases_per_day_P","V1","V2")]
+  data_real <- dt_fourth[,c("time", "AnzahlFall")]
+  data_validation <- merge(data_model, data_real,by="time", all=F)
+  SSE <- sum((data_validation[,cases_per_day_P] - data_validation[,AnzahlFall])^2)
+  data_validation_V <- merge(data_model, dt_vacc_fourth, by="time")
+  SSE_V <- sum((data_validation_V[,V2] - data_validation_V[,Zweitimpfung])^2)
+  return(SSE+SSE_V)
+}
+
+
+#Optimize the parameters beta0, eta_1, and gamma_pos
+Opt <- optim(c(sigma_1=0.6, contact_reduction_2=0.655,contact_reduction_3=0.659,
+               v_1_1=0.02, v_1_2=0.02, v_2_1=0.01,v_2_2=0.002), 
+             SSE, 
+             method = "L-BFGS-B", 
+             lower = c(0,0,0,0,0,0,0), 
+             upper = c(1,1,1,1,1,1,1)) 
+
+Opt_par_fitted <- setNames(Opt$par, c("sigma_1","contact_reduction_2","contact_reduction_3",
+                                      "v_1_1","v_1_2","v_2_1","v_2_2"))
+Opt_par_fitted
+
+#Model with fitted parameters
+times <-seq(from=0,to=107,by=1)# returns a sequence
+xstart <-c(S=out_3[length(out_3$time),S], E=out_3[length(out_3$time),E],
+           I_a=out_3[length(out_3$time),I_a], I_p=out_3[length(out_3$time),I_p],
+           I_s=out_3[length(out_3$time),I_s], P=out_3[length(out_3$time),P], 
+           R=out_3[length(out_3$time),R], D=out_3[length(out_3$time),D],
+           R_u=out_3[length(out_3$time),R_u],
+           V1=out_3[length(out_3$time),V1], V2=out_3[length(out_3$time),V2])
+  
+
+out_4_fit <-as.data.table(
+  ode(func=model,
+      y=xstart,
+      times=times,
+      parms=Opt_par_fitted))
+
+out_4_fit$cases_per_day_P <- out_4_fit[,P-c(out_3[length(out_3$time)-1,P],P[1:length(P)-1])+
+                                 (D-c(out_3[length(out_3$time)-1,D],D[1:length(D)-1]))+
+                                 (R-c(out_3[length(out_3$time)-1,R],R[1:length(R)-1]))]
+
+
+#Model validation
+data_model <- out_4_fit[,c("time","cases_per_day_P","V1","V2")]
+data_real <- dt_fourth[,c("time", "AnzahlFall")]
+data_validation <- merge(data_model, data_real,by="time", all.x=T)
+data_validation_V <- merge(data_model, dt_vacc_fourth, by="time",all.x = T)
+
+
+``` 
+
+```{r, error=FALSE, fig.asp=1, message=FALSE, warning=FALSE, out.width='.55\\linewidth'}
+
+colors <- c("Data"="red", "Model"="black") 
+
+
+ggplot(data_validation, aes(x=time))+
+  geom_point(aes(y=AnzahlFall,color="Data"), size=1)+
+  geom_line(aes(y=cases_per_day_P,color="Model"))+
+  ggtitle("Daily detected cases")+
+  labs(x = "days since 2021/02/15",
+       y = "daily detected cases",
+       color = "Legend")+
+  scale_color_manual(values = colors)+
+  mytheme
+
+ggplot(data_validation, aes(x=time))+
+  geom_point(aes(y=cumsum(AnzahlFall),color="Data"), size=1)+
+  geom_line(aes(y=cumsum(cases_per_day_P),color="Model"))+
+  ggtitle("Cumulative detected cases")+
+  labs(x = "days since 2021/02/15",
+       y = "daily detected cases",
+       color = "Legend")+
+  scale_color_manual(values = colors)+
+  mytheme
+
+
+```
+
+
+
+```{r}
+
+# Compare different scenarios with data
+
+covid <- fread("RKI_COVID19_final.csv")
+covid_Munich <- covid[Bundesland=="Bayern"&Landkreis=="SK MÃ¼nchen",]
+covid_Munich <- separate(data=covid_Munich, col=Meldedatum,
+                         into=c("Meldedatum","Meldezeit"),sep=" ")
+covid_Munich <- covid_Munich[,c("AnzahlFall","AnzahlTodesfall","NeuerTodesfall",
+                                "AnzahlGenesen","NeuGenesen","Meldedatum")]
+
+dt_test <- data.table()
+# Calculating the daily detected cases
+dt_test$Meldedatum <- covid_Munich[,sum(AnzahlFall),by=Meldedatum][,1]
+dt_test$AnzahlFall <- covid_Munich[,sum(AnzahlFall),by=Meldedatum][,2]
+dt_test$AnzahlGenesen <- covid_Munich[,sum(AnzahlGenesen),by=Meldedatum][,2]
+dt_test$AnzahlTodesfall <- covid_Munich[,sum(AnzahlTodesfall),by=Meldedatum][,2]
+dt_test <- dt_test[order(as.Date(dt_test$Meldedatum, format="%Y/%m/%d")),]
+
+dt_test <- dt_test[593:length(dt_test$AnzahlFall)]
+
+# Calculation of days that have passed since the first detected case in Munich (2020/01/29)
+d1 <- as.Date(dt_test$Meldedatum)
+d2 <- c(as.Date(dt_test[1,Meldedatum]), as.Date(dt_test[1:length(Meldedatum)-1,Meldedatum]))
+dt_test$time <- cumsum(as.numeric(d1-d2))
+
+dt_test$time <- dt_test$time + rep(108, length(dt_test$time))
+
+
+rm(d1,d2,covid,covid_Munich)
+
+
+```
+
+# Scenario 1:
+
+
+```{r, warning=FALSE,message=FALSE,error=FALSE}
+
+#Preferred Model with Vaccinations
+
+intervention_period <- c(31,93)
+contact_reduction <- c(0.6,0.7,0.75)
+
+
+delta <- dt_third[,sum(AnzahlTodesfall)]/dt_third[,sum(AnzahlFall)]
+eta_0 <- 0.25
+eta_1 <- 0.9
+gamma_pos <- 0.1661059
+
+
+#Defining the model without vaccination
+model <-function(t, x, params){
+  ## first define state variables
+  S <- x[1]
+  E <- x[2]
+  I_a <- x[3]
+  I_p <- x[4]
+  I_s <- x[5]
+  P <- x[6]
+  R <- x[7]
+  D <- x[8]
+  R_u <- x[9]
+  V1 <- x[10]
+  V2 <- x[11]
+  ## now define parameters
+  sigma_1 <- params["sigma_1"]
+  contact_reduction_2 <- params["contact_reduction_2"]
+  contact_reduction_3 <- params["contact_reduction_3"]
+  v_1_1 <- params["v_1_1"]
+  v_1_2 <- params["v_1_2"]
+  v_2_1 <- params["v_2_1"]
+  v_2_2 <- params["v_2_2"]
+  ## Reduce contact rate over time because of interventions
+  sigma_1_t <- if_else(t <= 7,
+                       0.25,
+                       sigma_1)
+  beta_t <- if_else(t <= intervention_period[1],
+                    beta0 * contact_reduction[1],
+                    if_else(t <= intervention_period[2],
+                    beta0 * contact_reduction_2,
+                    beta0 *contact_reduction_3))
+  v_1_t <- if_else(t <= 75,
+                   v_1_1,
+                   v_1_2)
+  v_2_t <- if_else(t <= 50,
+                   v_2_1,
+                   v_2_2)
+  ## now code the model equations
+  dSdt <- -((beta_t*x[3]+beta_t*x[4]+0.6*beta_t*x[5]+0.1*beta_t*x[6])/(N-x[8]))*x[1]-
+    v_1_t*x[1]
+  dEdt <- ((beta_t*x[3]+beta_t*x[4]+0.6*beta_t*x[5]+0.1*beta_t*x[6])/(N-x[8]))*x[1]+
+    sigma_1_t*((beta_t*x[3]+beta_t*x[4]+0.6*beta_t*x[5]+0.1*beta_t*x[6])/(N-x[8]))*x[10]-
+    (1/5.5)*x[2]
+  dI_adt <- (1-0.69)*(1/5.5)*x[2]-(1/6)*x[3]
+  dI_pdt <- 0.69*(1/5.5)*x[2]-(1/2)*x[4]
+  dI_sdt <- (1-eta_0)*(1/2)*x[4]-(1/7)*x[5]
+  dPdt <- eta_0*(1/6)*x[3]+eta_0*(1/2)*x[4]+eta_1*(1/7)*x[5]-gamma_pos*x[6]
+  dRdt <- (1-delta)*gamma_pos*x[6]
+  dDdt <- delta*gamma_pos*x[6]
+  dR_udt <- (1-eta_1)*(1/7)*x[5]+(1-eta_0)*(1/6)*x[3]
+  dV1dt <- v_1_t*x[1]-sigma_1_t*((beta_t*x[3]+beta_t*x[4]+0.6*beta_t*x[5]+0.1*beta_t*x[6])/(N-x[8]))*x[10]-
+    v_2_t*x[10]
+  dV2dt <- v_2_t*x[10]
+  list(c(dSdt,dEdt,dI_adt,dI_pdt,dI_sdt,dPdt,dRdt,dDdt,dR_udt,dV1dt,dV2dt))## return result as a list
+}
+
+
+#Model with fitted parameters
+times <-seq(from=0,to=230,by=1)# returns a sequence
+xstart <-c(S=out_3[length(out_3$time),S], E=out_3[length(out_3$time),E],
+           I_a=out_3[length(out_3$time),I_a], I_p=out_3[length(out_3$time),I_p],
+           I_s=out_3[length(out_3$time),I_s], P=out_3[length(out_3$time),P], 
+           R=out_3[length(out_3$time),R], D=out_3[length(out_3$time),D],
+           R_u=out_3[length(out_3$time),R_u],
+           V1=out_3[length(out_3$time),V1], V2=out_3[length(out_3$time),V2])
+
+
+parameters <- Opt_par_fitted
+
+out_4 <-as.data.table(
+  ode(func=model,
+      y=xstart,
+      times=times,
+      parms=parameters))
+
+out_4$cases_per_day_P <- out_4[,P-c(out_3[length(out_3$time)-1,P],P[1:length(P)-1])+
+                                 (D-c(out_3[length(out_3$time)-1,D],D[1:length(D)-1]))+
+                                 (R-c(out_3[length(out_3$time)-1,R],R[1:length(R)-1]))]
+
+
+#Model validation
+data_model <- out_4[,c("time","cases_per_day_P","V1","V2")]
+data_real <- dt_fourth[,c("time", "AnzahlFall")]
+data_validation_1 <- merge(data_model, data_real,by="time", all.x=T)
+data_validation_V_1 <- merge(data_model, dt_vacc_fourth, by="time",all.x = T)
+
+data_validation_1$Scenario <- rep("Optimal scenario", length(data_validation_1$time))
+data_validation_V_1$Scenario <- rep("Optimal scenario", length(data_validation_V_1$time))
+
+
+``` 
+
+
+
+
+# Scenario 2
+
+```{r,warning=FALSE,message=FALSE,error=FALSE}
+
+#Preferred Model with Vaccinations
+
+intervention_period <- c(31,93,107,123)
+contact_reduction <- c(0.6,0.7,0.7,0.8,0.85)
+
+
+delta <- dt_third[,sum(AnzahlTodesfall)]/dt_third[,sum(AnzahlFall)]
+sigma_1 <- 0.3
+eta_0 <- 0.25
+eta_1 <- 0.9
+gamma_pos <- 0.1661059
+
+
+#Defining the model without vaccination
+model <-function(t, x, params){
+  ## first define state variables
+  S <- x[1]
+  E <- x[2]
+  I_a <- x[3]
+  I_p <- x[4]
+  I_s <- x[5]
+  P <- x[6]
+  R <- x[7]
+  D <- x[8]
+  R_u <- x[9]
+  V1 <- x[10]
+  V2 <- x[11]
+  ## now define parameters
+  sigma_1 <- params["sigma_1"]
+  contact_reduction_2 <- params["contact_reduction_2"]
+  contact_reduction_3 <- params["contact_reduction_3"]
+  v_1_1 <- params["v_1_1"]
+  v_1_2 <- params["v_1_2"]
+  v_2_1 <- params["v_2_1"]
+  v_2_2 <- params["v_2_2"]
+  ## Reduce contact rate over time because of interventions
+  sigma_1_t <- if_else(t <= 7,
+                       0.25,
+                       sigma_1)
+  beta_t <- if_else(t <= intervention_period[1],
+                    beta0 * contact_reduction[1],
+                    if_else(t <= intervention_period[2],
+                    beta0 * contact_reduction_2,
+                    if_else(t <= intervention_period[3],
+                    beta0 * contact_reduction_3,
+                    if_else(t <= intervention_period[4],
+                    beta0 * contact_reduction[4],
+                    beta0 *contact_reduction[5]))))
+  v_1_t <- if_else(t <= 75,
+                   v_1_1,
+                   if_else(t <= 107,
+                   v_1_2,
+                   v_1_2*0.5))
+  v_2_t <- if_else(t <= 50,
+                   v_2_1,
+                   if_else(t <= 107,
+                   v_2_2,
+                   v_2_2*0.5))
+  ## now code the model equations
+  dSdt <- -((beta_t*x[3]+beta_t*x[4]+0.6*beta_t*x[5]+0.1*beta_t*x[6])/(N-x[8]))*x[1]-
+    v_1_t*x[1]
+  dEdt <- ((beta_t*x[3]+beta_t*x[4]+0.6*beta_t*x[5]+0.1*beta_t*x[6])/(N-x[8]))*x[1]+
+    sigma_1_t*((beta_t*x[3]+beta_t*x[4]+0.6*beta_t*x[5]+0.1*beta_t*x[6])/(N-x[8]))*x[10]-
+    (1/5.5)*x[2]
+  dI_adt <- (1-0.69)*(1/5.5)*x[2]-(1/6)*x[3]
+  dI_pdt <- 0.69*(1/5.5)*x[2]-(1/2)*x[4]
+  dI_sdt <- (1-eta_0)*(1/2)*x[4]-(1/7)*x[5]
+  dPdt <- eta_0*(1/6)*x[3]+eta_0*(1/2)*x[4]+eta_1*(1/7)*x[5]-gamma_pos*x[6]
+  dRdt <- (1-delta)*gamma_pos*x[6]
+  dDdt <- delta*gamma_pos*x[6]
+  dR_udt <- (1-eta_1)*(1/7)*x[5]+(1-eta_0)*(1/6)*x[3]
+  dV1dt <- v_1_t*x[1]-sigma_1_t*((beta_t*x[3]+beta_t*x[4]+0.6*beta_t*x[5]+0.1*beta_t*x[6])/(N-x[8]))*x[10]-
+    v_2_t*x[10]
+  dV2dt <- v_2_t*x[10]
+  list(c(dSdt,dEdt,dI_adt,dI_pdt,dI_sdt,dPdt,dRdt,dDdt,dR_udt,dV1dt,dV2dt))## return result as a list
+}
+
+
+#Model with fitted parameters
+times <-seq(from=0,to=230,by=1)# returns a sequence
+xstart <-c(S=out_3[length(out_3$time),S], E=out_3[length(out_3$time),E],
+           I_a=out_3[length(out_3$time),I_a], I_p=out_3[length(out_3$time),I_p],
+           I_s=out_3[length(out_3$time),I_s], P=out_3[length(out_3$time),P], 
+           R=out_3[length(out_3$time),R], D=out_3[length(out_3$time),D],
+           R_u=out_3[length(out_3$time),R_u],
+           V1=out_3[length(out_3$time),V1], V2=out_3[length(out_3$time),V2])
+
+
+parameters <- Opt_par_fitted
+
+out_4 <-as.data.table(
+  ode(func=model,
+      y=xstart,
+      times=times,
+      parms=parameters))
+
+out_4$cases_per_day_P <- out_4[,P-c(out_3[length(out_3$time)-1,P],P[1:length(P)-1])+
+                                 (D-c(out_3[length(out_3$time)-1,D],D[1:length(D)-1]))+
+                                 (R-c(out_3[length(out_3$time)-1,R],R[1:length(R)-1]))]
+
+
+#Model validation
+data_model <- out_4[,c("time","cases_per_day_P","V1","V2")]
+data_real <- dt_fourth[,c("time", "AnzahlFall")]
+data_validation_2 <- merge(data_model, data_real,by="time", all.x=T)
+data_validation_V_2 <- merge(data_model, dt_vacc_fourth, by="time",all.x = T)
+
+data_validation_2$Scenario <- rep("Severe scenario", length(data_validation_2$time))
+data_validation_V_2$Scenario <- rep("Severe scenario", length(data_validation_V_2$time))
+
+``` 
+
+
+
+
+
+# Scenario 3
+
+```{r,warning=FALSE,message=FALSE,error=FALSE}
+
+#Preferred Model with Vaccinations
+
+intervention_period <- c(31,93,107,123)
+contact_reduction <- c(0.6,0.7,0.7,0.85,0.9)
+
+
+delta <- dt_fourth[,sum(AnzahlTodesfall)]/dt_fourth[,sum(AnzahlFall)]
+sigma_1 <- 0.3
+eta_0 <- 0.25
+eta_1 <- 0.9
+gamma_pos <- 0.1661059
+
+
+#Defining the model without vaccination
+model <-function(t, x, params){
+  ## first define state variables
+  S <- x[1]
+  E <- x[2]
+  I_a <- x[3]
+  I_p <- x[4]
+  I_s <- x[5]
+  P <- x[6]
+  R <- x[7]
+  D <- x[8]
+  R_u <- x[9]
+  V1 <- x[10]
+  V2 <- x[11]
+  ## now define parameters
+  sigma_1 <- params["sigma_1"]
+  contact_reduction_2 <- params["contact_reduction_2"]
+  contact_reduction_3 <- params["contact_reduction_3"]
+  v_1_1 <- params["v_1_1"]
+  v_1_2 <- params["v_1_2"]
+  v_2_1 <- params["v_2_1"]
+  v_2_2 <- params["v_2_2"]
+  ## Reduce contact rate over time because of interventions
+  sigma_1_t <- if_else(t <= 7,
+                       0.25,
+                       sigma_1)
+  beta_t <- if_else(t <= intervention_period[1],
+                    beta0 * contact_reduction[1],
+                    if_else(t <= intervention_period[2],
+                    beta0 * contact_reduction_2,
+                    if_else(t <= intervention_period[3],
+                    beta0 * contact_reduction_3,
+                    if_else(t <= intervention_period[4],
+                    beta0 * contact_reduction[4],
+                    beta0 *contact_reduction[5]))))
+  v_1_t <- if_else(t <= 75,
+                   v_1_1,
+                   if_else(t <= 109,
+                   v_1_2,
+                   0))
+  v_2_t <- if_else(t <= 50,
+                   v_2_1,
+                   if_else(t <= 109,
+                   v_2_2,
+                   0))
+  ## now code the model equations
+  dSdt <- -((beta_t*x[3]+beta_t*x[4]+0.6*beta_t*x[5]+0.1*beta_t*x[6])/(N-x[8]))*x[1]-
+    v_1_t*x[1]
+  dEdt <- ((beta_t*x[3]+beta_t*x[4]+0.6*beta_t*x[5]+0.1*beta_t*x[6])/(N-x[8]))*x[1]+
+    sigma_1_t*((beta_t*x[3]+beta_t*x[4]+0.6*beta_t*x[5]+0.1*beta_t*x[6])/(N-x[8]))*x[10]-
+    (1/5.5)*x[2]
+  dI_adt <- (1-0.69)*(1/5.5)*x[2]-(1/6)*x[3]
+  dI_pdt <- 0.69*(1/5.5)*x[2]-(1/2)*x[4]
+  dI_sdt <- (1-eta_0)*(1/2)*x[4]-(1/7)*x[5]
+  dPdt <- eta_0*(1/6)*x[3]+eta_0*(1/2)*x[4]+eta_1*(1/7)*x[5]-gamma_pos*x[6]
+  dRdt <- (1-delta)*gamma_pos*x[6]
+  dDdt <- delta*gamma_pos*x[6]
+  dR_udt <- (1-eta_1)*(1/7)*x[5]+(1-eta_0)*(1/6)*x[3]
+  dV1dt <- v_1_t*x[1]-sigma_1_t*((beta_t*x[3]+beta_t*x[4]+0.6*beta_t*x[5]+0.1*beta_t*x[6])/(N-x[8]))*x[10]-
+    v_2_t*x[10]
+  dV2dt <- v_2_t*x[10]
+  list(c(dSdt,dEdt,dI_adt,dI_pdt,dI_sdt,dPdt,dRdt,dDdt,dR_udt,dV1dt,dV2dt))## return result as a list
+}
+
+
+#Model with fitted parameters
+times <-seq(from=0,to=230,by=1)# returns a sequence
+xstart <-c(S=out_3[length(out_3$time),S], E=out_3[length(out_3$time),E],
+           I_a=out_3[length(out_3$time),I_a], I_p=out_3[length(out_3$time),I_p],
+           I_s=out_3[length(out_3$time),I_s], P=out_3[length(out_3$time),P], 
+           R=out_3[length(out_3$time),R], D=out_3[length(out_3$time),D],
+           R_u=out_3[length(out_3$time),R_u],
+           V1=out_3[length(out_3$time),V1], V2=out_3[length(out_3$time),V2])
+
+
+parameters <- Opt_par_fitted
+  
+out_4 <-as.data.table(
+  ode(func=model,
+      y=xstart,
+      times=times,
+      parms=parameters))
+
+out_4$cases_per_day_P <- out_4[,P-c(out_3[length(out_3$time)-1,P],P[1:length(P)-1])+
+                                 (D-c(out_3[length(out_3$time)-1,D],D[1:length(D)-1]))+
+                                 (R-c(out_3[length(out_3$time)-1,R],R[1:length(R)-1]))]
+
+
+#Model validation
+data_model <- out_4[,c("time","cases_per_day_P","V1","V2")]
+data_real <- dt_fourth[,c("time", "AnzahlFall")]
+data_validation_3 <- merge(data_model, data_real,by="time", all.x=T)
+data_validation_V_3 <- merge(data_model, dt_vacc_fourth, by="time",all.x = T)
+
+data_validation_3$Scenario <- rep("Extreme scenario", length(data_validation_3$time))
+data_validation_V_3$Scenario <- rep("Extreme scenario", length(data_validation_V_3$time))
+
+``` 
+
+
+
+
+# Summary
+
+```{r, error=FALSE, fig.asp=1, message=FALSE, warning=FALSE, out.width='.55\\linewidth'}
+
+data_validation$Scenario <- rep("Fitted", length(data_validation$time))
+data_validation_p <- data_validation
+data_validation_p$time <- data_validation_p$time + rep(518, length(data_validation_p$time))
+
+data_validation_V$Scenario <- rep("Fitted", length(data_validation_V$time))
+
+
+data_validation_1_a <- data_validation_1[109:231,]
+data_validation_1_a_p <- data_validation_1[109:231,]
+data_validation_1_a_p$time <- data_validation_1_a_p$time + rep(518, length(data_validation_1_a_p$time))
+
+data_validation_2_a <- data_validation_2[109:231,]
+data_validation_2_a_p <- data_validation_2[109:231,]
+data_validation_2_a_p$time <- data_validation_2_a_p$time + rep(518, length(data_validation_2_a_p$time))
+
+data_validation_3_a<- data_validation_3[109:231,]
+data_validation_3_a_p <- data_validation_3[109:231,]
+data_validation_3_a_p$time <- data_validation_3_a_p$time + rep(518, length(data_validation_3_a_p$time))
+
+dt_validation_all_scenarios <- rbind(data_validation,
+                                     data_validation_1_a,
+                                     data_validation_2_a,
+                                     data_validation_3_a)
+                                  
+dt_validation_V_all_scenarios <- rbind(data_validation_V,
+                                       data_validation_V_1,
+                                       data_validation_V_2,
+                                       data_validation_V_3)
+
+dt_validation_all_scenarios_p <- rbind(data_validation_p,
+                                     data_validation_1_a_p,
+                                     data_validation_2_a_p,
+                                     data_validation_3_a_p)
+                                  
+```
+
+
+
+```{r, error=FALSE, fig.asp=1, message=FALSE, warning=FALSE, out.width='.55\\linewidth'}
+
+
+colors <- c("Data"="red", "Extreme scenario"="indianred2", "Severe scenario"="lightslateblue",
+            "Optimal scenario"="aquamarine3", "Fitted"="black") 
+
+
+###Summary daily detected
+
+p <- ggplot(dt_validation_all_scenarios, aes(x=time))+
+  geom_point(aes(y=AnzahlFall,color="Data"))+
+  geom_line(aes(y=cases_per_day_P,color=Scenario), size=0.8)+
+  #ggtitle("Daily detected cases")+
+  labs(x = "days since 2021/06/30",
+       y = "daily detected cases",
+       color = "Legend")+
+  geom_vline(xintercept = 107, color="red", linetype="dashed")+
+  scale_color_manual(values = colors)+
+  annotate(geom = "text", label="Fitted Model", x=50, y=1200, size=5)+
+  annotate(geom = "text", label="Predictions", x=160, y=1200, size=5)+
+  annotate(geom = "text", label="Extreme", x=220, y=910, color="indianred2", size=5)+
+  annotate(geom = "text", label="Optimal", x=175, y=65, color="aquamarine3", size=5)+
+  annotate(geom = "text", label="Severe", x=220, y=260, color="lightslateblue", size=5)+
+  theme(legend.position = "none",
+        axis.title=element_text(size=15), axis.text = element_text(size=15),
+        axis.title.y = element_text(margin = margin(t = 0, r = 5, b = 0, l = 0)),
+        axis.title.x = element_text(margin = margin(t = 5, r = 0, b = 0, l = 0)),
+        legend.title = element_blank(),
+        legend.text = element_text(size=15),
+        strip.text = element_text(size=15),
+        panel.background = element_rect(fill = "white",colour = "black", size = 0.3),
+        panel.grid.major = element_line(linetype = 'solid',colour = "grey90",size=0.35),
+        panel.grid.minor = element_line(linetype = 'solid',colour = "grey90",size=0.35))
+  
+p
+
+
+```
+
+```{r, error=FALSE, fig.asp=1, message=FALSE, warning=FALSE, out.width='.55\\linewidth'}
+
+
+####Summary cumulative detected
+
+a <- data_validation[,cumsum(cases_per_day_P)][length(data_validation$cases_per_day_P)]
+p_cum <- ggplot(dt_validation_all_scenarios, aes(x=time))+
+  geom_point(aes(y=cumsum(AnzahlFall),color="Data"))+
+  geom_vline(xintercept = 107, color="red", linetype="dashed")+
+  geom_line(data=data_validation, aes(y=cumsum(cases_per_day_P), color="Fitted"), size=0.8)+
+  geom_line(data=data_validation_1_a, aes(y=a+cumsum(cases_per_day_P), color="Optimal scenario"), size=0.8)+
+  geom_line(data=data_validation_2_a, aes(y=a+cumsum(cases_per_day_P), color="Severe scenario"), size=0.8)+
+  geom_line(data=data_validation_3_a, aes(y=a+cumsum(cases_per_day_P),color="Extreme scenario"), size=0.8)+
+  #ggtitle("Cumulative detected cases")+
+  labs(x = "days since 2021/06/30",
+       y = "total detected cases",
+       color = "Legend")+
+  scale_color_manual(values = colors)+
+  annotate(geom = "text", label="Fitted Model", x=50, y=125000, size=5)+
+  annotate(geom = "text", label="Predictions", x=160, y=125000, size=5)+
+  annotate(geom = "text", label="Extreme", x=225, y=93000, color="indianred2", size=5)+
+  annotate(geom = "text", label="Optimal", x=225, y=30000, color="aquamarine3", size=5)+
+  annotate(geom = "text", label="Severe", x=225, y=62000, color="lightslateblue", size=5)+
+  theme(legend.position = "none",
+        axis.title=element_text(size=15), axis.text = element_text(size=15),
+        axis.title.y = element_text(margin = margin(t = 0, r = 5, b = 0, l = 0)),
+        axis.title.x = element_text(margin = margin(t = 5, r = 0, b = 0, l = 0)),
+        legend.title = element_blank(),
+        legend.text = element_text(size=15),
+        strip.text = element_text(size=15),
+        panel.background = element_rect(fill = "white",colour = "black", size = 0.3),
+        panel.grid.major = element_line(linetype = 'solid',colour = "grey90",size=0.35),
+        panel.grid.minor = element_line(linetype = 'solid',colour = "grey90",size=0.35))
+  
+p_cum
+
+```
+
+
+```{r, error=FALSE, fig.asp=1, message=FALSE, warning=FALSE, out.width='.55\\linewidth'}
+
+## All results together
+
+out_1_p <- out_1
+out_2_p <- out_2
+out_2_p$time <- out_2_p$time + rep(138, length(out_2_p$time))
+out_3_p <- out_3
+out_3_p$time <- out_3_p$time + rep(383, length(out_3_p$time))
+
+p_summary <- ggplot(dt_validation_all_scenarios_p, aes(x=time))+
+  geom_point(aes(y=AnzahlFall,color="Data"), size=2)+
+  geom_line(aes(y=cases_per_day_P,color=Scenario), size=1.2)+
+  #ggtitle("Daily detected cases")+
+  labs(x = "days since 2020/01/29",
+       y = "daily detected cases",
+       color = "Legend")+
+  geom_vline(xintercept = 625, color="red", linetype="dashed")+
+  scale_color_manual(values = colors)+
+  annotate(geom = "text", label="Fitted Model", x=200, y=1250, size=5)+
+  annotate(geom = "text", label="Predictions", x=700, y=1250, size=5)+
+  annotate(geom = "text", label="Extreme", x=765, y=900, color="indianred2", size=5)+
+  annotate(geom = "text", label="Optimal", x=700, y=15, color="aquamarine3", size=5)+
+  annotate(geom = "text", label="Severe", x=765, y=260, color="lightslateblue", size=5)+
+  geom_point(data=dt, aes(y=AnzahlFall,color="Data"))+
+  geom_line(data=out_1_p, aes(y=cases_per_day_P), size=1.2)+
+  geom_line(data=out_2_p, aes(y=cases_per_day_P), size=1.2)+
+  geom_line(data=out_3_p, aes(y=cases_per_day_P), size=1.2)+
+  theme(legend.position = "none",
+        axis.title=element_text(size=15), axis.text = element_text(size=15),
+        axis.title.y = element_text(margin = margin(t = 0, r = 5, b = 0, l = 0)),
+        axis.title.x = element_text(margin = margin(t = 5, r = 0, b = 0, l = 0)),
+        legend.title = element_blank(),
+        legend.text = element_text(size=15),
+        strip.text = element_text(size=15),
+        panel.background = element_rect(fill = "white",colour = "black", size = 0.3),
+        panel.grid.major = element_line(linetype = 'solid',colour = "grey90",size=0.35),
+        panel.grid.minor = element_line(linetype = 'solid',colour = "grey90",size=0.35))
+  
+
+p_summary
+
+```
+
+
+```{r, error=FALSE, fig.asp=1, message=FALSE, warning=FALSE, out.width='.55\\linewidth'}
+
+## All results together - cumulative detected
+
+out_4_p <- out_4_fit
+out_4_p$time <- out_4_p$time + rep(518,length(out_4_p$time))
+
+dt_fitted <- rbind(out_1_p[-length(out_1_p$time),],out_2_p[-length(out_2_p$time),],
+                   out_3_p[-length(out_3_p$time),-c("V1","V2")],
+                   out_4_p[-length(out_4_p$time),-c("V1","V2")])
+
+
+b <- dt_all[,cumsum(AnzahlFall)][length(dt_all$time)]
+
+p_cum_summary <- ggplot(dt_fitted, aes(x=time))+
+  geom_point(data=dt_all, aes(y=cumsum(AnzahlFall),color="Data"),size=2)+
+  geom_line(aes(y=cumsum(cases_per_day_P), color="Fitted"),size=1.2)+
+  geom_line(data=data_validation_1_a_p, aes(y=b+cumsum(cases_per_day_P), color="Optimal scenario"), size=1.2)+
+  geom_line(data=data_validation_2_a_p, aes(y=b+cumsum(cases_per_day_P), color="Severe scenario"), size=1.2)+
+  geom_line(data=data_validation_3_a_p, aes(y=b+cumsum(cases_per_day_P),color="Extreme scenario"), size=1.2)+
+  geom_vline(xintercept = 625, color="red", linetype="dashed")+
+  #ggtitle("Cumulative detected cases")+
+  labs(x = "days since 2020/01/29",
+       y = "total detected cases",
+       color = "Legend")+
+  scale_color_manual(values = colors)+
+  annotate(geom = "text", label="Fitted Model", x=300, y=200000, size=5)+
+  annotate(geom = "text", label="Predictions", x=700, y=200000, size=5)+
+  annotate(geom = "text", label="Extreme", x=765, y=167000, color="indianred2", size=5)+
+  annotate(geom = "text", label="Optimal", x=765, y=100000, color="aquamarine3", size=5)+
+  annotate(geom = "text", label="Severe", x=765, y=130000, color="lightslateblue", size=5)+
+  theme(legend.position = "none",
+        axis.title=element_text(size=15), axis.text = element_text(size=15),
+        axis.title.y = element_text(margin = margin(t = 0, r = 5, b = 0, l = 0)),
+        axis.title.x = element_text(margin = margin(t = 5, r = 0, b = 0, l = 0)),
+        legend.title = element_blank(),
+        legend.text = element_text(size=15),
+        strip.text = element_text(size=15),
+        panel.background = element_rect(fill = "white",colour = "black", size = 0.3),
+        panel.grid.major = element_line(linetype = 'solid',colour = "grey90",size=0.35),
+        panel.grid.minor = element_line(linetype = 'solid',colour = "grey90",size=0.35))
+
+p_cum_summary
+
+```

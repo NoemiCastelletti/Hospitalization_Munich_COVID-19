@@ -1,0 +1,795 @@
+---
+title: "Predictions Hospital"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r,warning=FALSE,message=FALSE,error=FALSE}
+#{r setup, message=FALSE} to show code without messages
+
+#Loading all necessary libraries
+
+library(deSolve)
+library(ggplot2)
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(MASS)
+library(plyr)
+library(readr)
+library(tidyverse)
+library(ggpubr)
+
+mytheme <- theme(
+  plot.title = element_text(size=18),
+  axis.title = element_text(size=16), 
+  axis.text = element_text(size=16),
+  legend.title = element_text(size=16),
+  legend.text = element_text(size=16),
+  panel.background = element_rect(fill = "white",colour = "black", size = 0.3),
+  panel.grid.major = element_line(linetype = 'solid',colour = "grey90",size=0.35),
+  panel.grid.minor = element_line(linetype = 'solid',colour = "grey90",size=0.35)
+)
+
+```
+
+
+```{r,warning=FALSE,message=FALSE,error=FALSE}
+
+out_1_hosp <- fread("out_1_hosp.csv")
+out_2_hosp <- fread("out_2_hosp.csv")
+out_3_hosp <- fread("out_3_hosp.csv")
+
+```
+
+
+
+
+```{r, echo=FALSE,warning=FALSE,message=FALSE,error=FALSE}
+
+hospital_data <- fread("KH_data.csv")
+colnames(hospital_data) <- c("Klinik","Datum","Normalstation","IMC","ICU")
+                             
+dt_hosp <- data.table()
+dt_hosp$date <- hospital_data[,sum(Normalstation,na.rm = TRUE),by=Datum][,1]
+dt_hosp$covid_ward <- hospital_data[,sum(Normalstation,na.rm = TRUE),by=Datum][,2]
+dt_hosp$covid_icu <- hospital_data[,sum(IMC,na.rm = TRUE),by=Datum][,2]+
+  hospital_data[,sum(ICU,na.rm = TRUE),by=Datum][,2]
+
+dt_hosp <- dt_hosp[-c(341,342,343,344,345,346,347,348,349,350,351,352,353,354,355,356,357),]
+
+dt_hosp$date <- as.Date(dt_hosp$date)
+
+# Ergänzung zweite Welle vom Münchner Stadtportal: 2020/10/25 - 2020/11/10
+
+dt_second_ergaenzung <- fread("Ergänzung_2Welle_hosp.csv")
+dt_second_ergaenzung$date <- as.Date(dt_second_ergaenzung$date)
+
+
+dt_hosp <- rbind(dt_hosp,dt_second_ergaenzung)
+dt_hosp <- dt_hosp[order(as.Date(dt_hosp$date, format="%Y/%m/%d")),]
+
+# Calculation of days that have passed since the first detected case in Munich (2020/01/29)
+d1 <- as.Date(dt_hosp$date)
+d2 <- c(as.Date(dt_hosp[1,date]), as.Date(dt_hosp[1:length(date)-1,date]))
+dt_hosp$time <- cumsum(as.numeric(d1-d2))
+dt_hosp$time <- dt_hosp$time + rep(22, length(dt_hosp$time))
+
+dt_hosp_fourth_all <- dt_hosp[497:604]
+
+dt_hosp_fourth <- dt_hosp_fourth_all
+dt_hosp_fourth$time <- dt_hosp_fourth$time - rep(518, length(dt_hosp_fourth$time))
+
+
+
+#dt_vacc_fourth
+dt_vacc_fourth <- fread("Impfstatistik_stadtportal - ergänzt.csv")
+dt_vacc_fourth <- dt_vacc_fourth[95:171,]
+d1 <- as.Date(dt_vacc_fourth$Datum)
+d2 <- c(as.Date(dt_vacc_fourth[1,Datum]), as.Date(dt_vacc_fourth[1:length(Datum)-1,Datum]))
+dt_vacc_fourth$time <- cumsum(as.numeric(d1-d2))
+dt_vacc_fourth$time <- dt_vacc_fourth$time#+rep(43,length(dt_vacc_fourth$time))
+dt_vacc_fourth$vacc_1 <- dt_vacc_fourth[,Erstimpfung-Zweitimpfung]
+dt_vacc_fourth$vacc_2 <- dt_vacc_fourth[,Zweitimpfung]
+
+```
+
+
+
+# First Fitting
+
+```{r,warning=FALSE,message=FALSE,error=FALSE}
+
+# Hospital Model with Vaccinations
+
+N <- 1488202
+intervention_period <- c(31,93)
+contact_reduction <- c(0.6,0.7,0.75)
+
+# Take these
+v_2_1 <- 0.0085 # fitted manually
+v_2_2 <- 0.0012 # fitted manually
+
+eta_0 <- 0.25
+eta_1 <- 0.9
+delta <- 0.34
+gamma_icu <- (1/9)
+gamma_norm_1 <- (1/1) 
+gamma_norm_2 <- (1/7)
+gamma_pos_1 <- 0.50833231   #adapted from Model 5 during third wave
+gamma_pos_2 <- 0.17888039   #adapted from Model 5 during third wave
+beta0 <- 1.305984   #0.81624030*1.6
+sigma_alpha <- 0.25
+sigma_delta <- 0.601676567 #adapted from Model 5 during fourth wave
+contact_reduction_2 <- 0.656816261  #adapted from Model 5 during fourth wave
+contact_reduction_3 <- 0.660806726 #adapted from Model 5 during fourth wave
+
+
+#Defining the model
+model <-function(t, x, params){
+  ## first define state variables
+  S <- x[1]
+  E <- x[2]
+  I_a <- x[3]
+  I_p <- x[4]
+  I_s <- x[5]
+  P <- x[6]
+  H_norm <- x[7]
+  H_icu <- x[8]
+  D <- x[9]
+  R <- x[10]
+  V1 <- x[11]
+  V2 <- x[12]
+  ## now define parameters 
+  h_0 <- params["h_0"]
+  h_1 <- params["h_1"]
+  v_1_1 <- params["v_1_1"]
+  v_1_2 <- params["v_1_2"]
+  #v_2_1 <- params["v_2_1"]
+  #v_2_2 <- params["v_2_2"]
+  ## Reduce contact rate over time because of interventions
+  sigma <- if_else(t <= 7,
+                    sigma_alpha,
+                    sigma_delta)
+  beta_t <- if_else(t <= intervention_period[1],
+                    beta0 * contact_reduction[1],
+                    if_else(t <= intervention_period[2],
+                    beta0 * contact_reduction_2,
+                    beta0 *contact_reduction_3))
+  v_1_t <- if_else(t <= 45,
+                   v_1_1,
+                   v_1_2)
+  v_2_t <- if_else(t <= 45,
+                   v_2_1,
+                   v_2_2)
+  ## now code the model equations
+  dSdt <- -((beta_t*I_a+beta_t*I_p+0.6*beta_t*I_s+0.1*beta_t*P)/(N-D))*S - v_1_t*S
+  
+  dEdt <- ((beta_t*I_a+beta_t*I_p+0.6*beta_t*I_s+0.1*beta_t*P)/(N-D))*S+
+    sigma*((beta_t*I_a+beta_t*I_p+0.6*beta_t*I_s+0.1*beta_t*P)/(N-D))*V1-(1/5.5)*E
+  dI_adt <- (1-0.69)*(1/5.5)*E-(1/6)*I_a
+  dI_pdt <- 0.69*(1/5.5)*E-(1/2)*I_p
+  dI_sdt <- (1-eta_0)*(1/2)*I_p-(1/7)*I_s
+  dPdt <- eta_0*(1/6)*I_a+eta_0*(1/2)*I_p+eta_1*(1/7)*I_s-h_0*gamma_pos_1*P-(1-h_0)*gamma_pos_2*P
+  dH_normdt <- h_0*gamma_pos_1*P+(1-delta)*gamma_icu*H_icu-
+    (1-h_1)*gamma_norm_2*H_norm-h_1*gamma_norm_1*H_norm
+  dH_icudt <- h_1*gamma_norm_1*H_norm-gamma_icu*H_icu
+  dDdt <- delta*gamma_icu*H_icu
+  dRdt <- (1-eta_0)*(1/6)*I_a+(1-eta_1)*(1/7)*I_s+(1-h_0)*gamma_pos_2*P+(1-h_1)*gamma_norm_2*H_norm
+  dV1dt <- v_1_t*S-sigma*((beta_t*I_a+beta_t*I_p+0.6*beta_t*I_s+0.1*beta_t*P)/(N-D))*V1-v_2_t*V2
+  dV2dt <- v_2_t*V2
+  ## return result as a list!
+  list(c(dSdt,dEdt,dI_adt,dI_pdt,dI_sdt,dPdt,dH_normdt,dH_icudt,dDdt,dRdt,dV1dt,dV2dt))
+}
+
+
+
+SSE <- function(parameters){
+  names(parameters) <- c("h_0","h_1","v_1_1","v_1_2")
+  times <-seq(from=0,to=107,by=1)# returns a sequence
+  xstart <-c(S=out_3_hosp[length(out_3_hosp$time),S],
+             E=out_3_hosp[length(out_3_hosp$time),E],
+             I_a=out_3_hosp[length(out_3_hosp$time),I_a],
+             I_p=out_3_hosp[length(out_3_hosp$time),I_p],
+             I_s=out_3_hosp[length(out_3_hosp$time),I_s],
+             P=out_3_hosp[length(out_3_hosp$time),P],
+             H_norm=out_3_hosp[length(out_3_hosp$time),H_norm],
+             H_icu=out_3_hosp[length(out_3_hosp$time),H_icu], 
+             D=out_3_hosp[length(out_3_hosp$time),D],
+             R=out_3_hosp[length(out_3_hosp$time),R],
+             V1=out_3_hosp[length(out_3_hosp$time),V1], 
+             V2=out_3_hosp[length(out_3_hosp$time),V2])
+  out <-as.data.table(
+    ode(
+      func=model,
+      y=xstart,
+      times=times,
+      parms=parameters))
+  data_model <- out[,c("time", "H_icu","H_norm","V1","V2")]
+  data_real <- dt_hosp_fourth[,c("time", "covid_icu","covid_ward")]
+  data_validation <- merge(data_model, data_real,by="time", all = F)
+  data_validation_V <- merge(data_model, dt_vacc_fourth, by="time",all = F)
+  SSE_icu <- sum((data_validation[,H_icu] - data_validation[,covid_icu])^2)
+  SSE_ward <- sum((data_validation[,H_norm] - data_validation[,covid_ward])^2)
+  return(SSE_ward+SSE_icu)
+}
+
+
+#Optimize the parameters gamma_norm_1, gamma_icu
+Opt <- optim(c(h_0=0.02,h_1=0.04,v_1_1=0.05,v_1_2=0.001),
+             SSE,
+             method = "L-BFGS-B",
+             lower = c(0,0,0,0),
+             upper = c(1,1,0.2,0.04))
+Opt_par_hosp_fitted <- setNames(Opt$par, c("h_0","h_1",
+                                           "v_1_1","v_1_2"))
+Opt_par_hosp_fitted
+
+
+#Model with fitted parameters
+
+times <-seq(from=0,to=107,by=1)# returns a sequence
+xstart <-c(S=out_3_hosp[length(out_3_hosp$time),S],
+             E=out_3_hosp[length(out_3_hosp$time),E],
+             I_a=out_3_hosp[length(out_3_hosp$time),I_a],
+             I_p=out_3_hosp[length(out_3_hosp$time),I_p],
+             I_s=out_3_hosp[length(out_3_hosp$time),I_s],
+             P=out_3_hosp[length(out_3_hosp$time),P],
+             H_norm=out_3_hosp[length(out_3_hosp$time),H_norm],
+           H_icu=out_3_hosp[length(out_3_hosp$time),H_icu], 
+           D=out_3_hosp[length(out_3_hosp$time),D],
+           R=out_3_hosp[length(out_3_hosp$time),R],
+           V1=out_3_hosp[length(out_3_hosp$time),V1], 
+           V2=out_3_hosp[length(out_3_hosp$time),V2])
+
+out_4_hosp <-as.data.table(
+  ode(
+    func=model,
+    y=xstart,
+    times=times,
+    parms=Opt_par_hosp_fitted))
+
+
+#Model validation
+data_model <- out_4_hosp[,c("time", "H_icu","H_norm","V1","V2")]
+data_real <- dt_hosp_fourth[,c("time", "covid_icu","covid_ward")]
+data_validation <- merge(data_model, data_real,by="time", all.x=T)
+data_validation_V <- merge(data_model, dt_vacc_fourth, by="time",all.x=T)
+
+```
+
+
+
+```{r,warning=FALSE,message=FALSE,error=FALSE, out.width='.55\\linewidth',fig.asp=1}
+
+colors <- c("Model"="black","Data"="red","ICU" = "red", "Normal ward" = "blue")
+
+ggplot(data_validation, aes(x=time))+
+  geom_point(aes(y=covid_icu,color="ICU"), size=1)+
+  geom_line(aes(y=H_icu,color="ICU"))+
+  geom_point(aes(y=covid_ward,color="Normal ward"), size=1)+
+  geom_line(aes(y=H_norm,color="Normal ward"))+
+  ggtitle("Number of COVID-19 patients")+
+  labs(x = "days since 2021/02/15",
+       y = "COVID-19 patients",
+       color = "Legend")+
+  scale_color_manual(values = colors)+
+  mytheme
+
+ggplot(data_validation, aes(x=time))+
+  geom_point(aes(y=cumsum(covid_icu),color="ICU"), size=1)+
+  geom_line(aes(y=cumsum(H_icu), color="ICU"))+
+  geom_point(aes(y=cumsum(covid_ward),color="Normal ward"), size=1)+
+  geom_line(aes(y=cumsum(H_norm), color="Normal ward"))+
+  ggtitle("Cumulative number of COVID-19 patients")+
+  labs(x = "days since 2021/02/15",
+       y = "COVID-19 patients",
+       color = "Legend")+
+  scale_color_manual(values = colors)+
+  mytheme
+
+```
+
+
+
+# Scenario 1:
+
+
+```{r, error=FALSE, message=FALSE, warning=FALSE}
+
+# Hospital Model with Vaccinations
+
+#Defining the model
+model <-function(t, x, params){
+  ## first define state variables
+  S <- x[1]
+  E <- x[2]
+  I_a <- x[3]
+  I_p <- x[4]
+  I_s <- x[5]
+  P <- x[6]
+  H_norm <- x[7]
+  H_icu <- x[8]
+  D <- x[9]
+  R <- x[10]
+  V1 <- x[11]
+  V2 <- x[12]
+  ## now define parameters 
+  h_0 <- params["h_0"]
+  h_1 <- params["h_1"]
+  v_1_1 <- params["v_1_1"]
+  v_1_2 <- params["v_1_2"]
+  # v_2_1 <- params["v_2_1"]
+  # v_2_2 <- params["v_2_2"]
+  ## Reduce contact rate over time because of interventions
+  sigma <- if_else(t <= 7,
+                    sigma_alpha,
+                    sigma_delta)
+  beta_t <- if_else(t <= intervention_period[1],
+                    beta0 * contact_reduction[1],
+                    if_else(t <= intervention_period[2],
+                    beta0 * contact_reduction_2,
+                    beta0 *contact_reduction_3))
+  v_1_t <- if_else(t <= 45,
+                   v_1_1,
+                   v_1_2)
+  v_2_t <- if_else(t <= 45,
+                   v_2_1,
+                   v_2_2)
+  ## now code the model equations
+  dSdt <- -((beta_t*I_a+beta_t*I_p+0.6*beta_t*I_s+0.1*beta_t*P)/(N-D))*S - v_1_t*S
+  
+  dEdt <- ((beta_t*I_a+beta_t*I_p+0.6*beta_t*I_s+0.1*beta_t*P)/(N-D))*S+
+    sigma*((beta_t*I_a+beta_t*I_p+0.6*beta_t*I_s+0.1*beta_t*P)/(N-D))*V1-(1/5.5)*E
+  dV1dt <- v_1_t*S-sigma*((beta_t*I_a+beta_t*I_p+0.6*beta_t*I_s+0.1*beta_t*P)/(N-D))*V1-v_2_t*V2
+  dV2dt <- v_2_t*V2
+  dI_adt <- (1-0.69)*(1/5.5)*E-(1/6)*I_a
+  dI_pdt <- 0.69*(1/5.5)*E-(1/2)*I_p
+  dI_sdt <- (1-eta_0)*(1/2)*I_p-(1/7)*I_s
+  dPdt <- eta_0*(1/6)*I_a+eta_0*(1/2)*I_p+eta_1*(1/7)*I_s-h_0*gamma_pos_1*P-(1-h_0)*gamma_pos_2*P
+  dH_normdt <- h_0*gamma_pos_1*P+(1-delta)*gamma_icu*H_icu-
+    (1-h_1)*gamma_norm_2*H_norm-h_1*gamma_norm_1*H_norm
+  dH_icudt <- h_1*gamma_norm_1*H_norm-gamma_icu*H_icu
+  dDdt <- delta*gamma_icu*H_icu
+  dRdt <- (1-eta_0)*(1/6)*I_a+(1-eta_1)*(1/7)*I_s+(1-h_0)*gamma_pos_2*P+(1-h_1)*gamma_norm_2*H_norm
+  ## return result as a list!
+  list(c(dSdt,dEdt,dI_adt,dI_pdt,dI_sdt,dPdt,dH_normdt,dH_icudt,dDdt,dRdt,dV1dt,dV2dt))
+}
+
+
+#Model with fitted parameters
+
+times <-seq(from=0,to=230,by=1)# returns a sequence
+
+out_4_hosp_1 <-as.data.table(
+  ode(
+    func=model,
+    y=xstart,
+    times=times,
+    parms=Opt_par_hosp_fitted))
+
+#Model validation
+data_model <- out_4_hosp_1[,c("time", "H_icu","H_norm","V1","V2")]
+data_real <- dt_hosp_fourth[,c("time", "covid_icu","covid_ward")]
+data_validation_1 <- merge(data_model, data_real,by="time", all.x=T)
+data_validation_V_1<- merge(data_model, dt_vacc_fourth, by="time",all.x=T)
+
+data_validation_1$Scenario <- rep("Optimal scenario", length(data_validation_1$time))
+data_validation_V_1$Scenario <- rep("Optimal scenario", length(data_validation_V_1$time))
+```
+
+
+
+# Scenario 2:
+
+```{r,warning=FALSE,message=FALSE,error=FALSE}
+
+# Hospital Model with Vaccinations
+
+N <- 1488202
+intervention_period <- c(31,93,107,123)
+contact_reduction <- c(0.6,0.7,0.75,0.8,0.85)
+
+
+#Defining the model
+model <-function(t, x, params){
+  ## first define state variables
+  S <- x[1]
+  E <- x[2]
+  I_a <- x[3]
+  I_p <- x[4]
+  I_s <- x[5]
+  P <- x[6]
+  H_norm <- x[7]
+  H_icu <- x[8]
+  D <- x[9]
+  R <- x[10]
+  V1 <- x[11]
+  V2 <- x[12]
+  ## now define parameters 
+  h_0 <- params["h_0"]
+  h_1 <- params["h_1"]
+  v_1_1 <- params["v_1_1"]
+  v_1_2 <- params["v_1_2"]
+  # v_2_1 <- params["v_2_1"]
+  # v_2_2 <- params["v_2_2"]
+  ## Reduce contact rate over time because of interventions
+  sigma <- if_else(t <= 7,
+                    sigma_alpha,
+                    sigma_delta)
+  beta_t <- if_else(t <= intervention_period[1],
+                    beta0 * contact_reduction[1],
+                    if_else(t <= intervention_period[2],
+                    beta0 * contact_reduction_2,
+                    if_else(t <= intervention_period[3],
+                    beta0 * contact_reduction_3,
+                    if_else(t <= intervention_period[4],
+                    beta0 * contact_reduction[4],
+                    beta0 *contact_reduction[5]))))
+  v_1_t <- if_else(t <= 45,
+                   v_1_1,
+                   if_else(t <= 107,
+                   v_1_2,
+                   v_1_2*0.5))
+  v_2_t <- if_else(t <= 45,
+                   v_2_1,
+                   if_else(t <= 107,
+                   v_2_2,
+                   v_2_2*0.5))
+  ## now code the model equations
+  dSdt <- -((beta_t*I_a+beta_t*I_p+0.6*beta_t*I_s+0.1*beta_t*P)/(N-D))*S - v_1_t*S
+  
+  dEdt <- ((beta_t*I_a+beta_t*I_p+0.6*beta_t*I_s+0.1*beta_t*P)/(N-D))*S+
+    sigma*((beta_t*I_a+beta_t*I_p+0.6*beta_t*I_s+0.1*beta_t*P)/(N-D))*V1-(1/5.5)*E
+  dV1dt <- v_1_t*S-sigma*((beta_t*I_a+beta_t*I_p+0.6*beta_t*I_s+0.1*beta_t*P)/(N-D))*V1-v_2_t*V2
+  dV2dt <- v_2_t*V2
+  dI_adt <- (1-0.69)*(1/5.5)*E-(1/6)*I_a
+  dI_pdt <- 0.69*(1/5.5)*E-(1/2)*I_p
+  dI_sdt <- (1-eta_0)*(1/2)*I_p-(1/7)*I_s
+  dPdt <- eta_0*(1/6)*I_a+eta_0*(1/2)*I_p+eta_1*(1/7)*I_s-h_0*gamma_pos_1*P-(1-h_0)*gamma_pos_2*P
+  dH_normdt <- h_0*gamma_pos_1*P+(1-delta)*gamma_icu*H_icu-
+    (1-h_1)*gamma_norm_2*H_norm-h_1*gamma_norm_1*H_norm
+  dH_icudt <- h_1*gamma_norm_1*H_norm-gamma_icu*H_icu
+  dDdt <- delta*gamma_icu*H_icu
+  dRdt <- (1-eta_0)*(1/6)*I_a+(1-eta_1)*(1/7)*I_s+(1-h_0)*gamma_pos_2*P+(1-h_1)*gamma_norm_2*H_norm
+  ## return result as a list!
+  list(c(dSdt,dEdt,dI_adt,dI_pdt,dI_sdt,dPdt,dH_normdt,dH_icudt,dDdt,dRdt,dV1dt,dV2dt))
+}
+
+
+#Model with fitted parameters
+
+times <-seq(from=0,to=230,by=1)# returns a sequence
+
+out_4_hosp_2 <-as.data.table(
+  ode(
+    func=model,
+    y=xstart,
+    times=times,
+    parms=Opt_par_hosp_fitted))
+
+#Model validation
+data_model <- out_4_hosp_2[,c("time", "H_icu","H_norm","V1","V2")]
+data_real <- dt_hosp_fourth[,c("time", "covid_icu","covid_ward")]
+data_validation_2 <- merge(data_model, data_real,by="time", all.x=T)
+data_validation_V_2<- merge(data_model, dt_vacc_fourth, by="time",all.x=T)
+
+data_validation_2$Scenario <- rep("Severe scenario", length(data_validation_2$time))
+data_validation_V_2$Scenario <- rep("Severe scenario", length(data_validation_V_2$time))
+
+```
+
+
+
+# Scenario 3:
+
+
+```{r,warning=FALSE,message=FALSE,error=FALSE}
+
+# Hospital Model with Vaccinations
+
+N <- 1488202
+
+intervention_period <- c(31,93,107,123)
+contact_reduction <- c(0.6,0.7,0.7,0.85,0.9)
+
+
+#Defining the model
+model <-function(t, x, params){
+  ## first define state variables
+  S <- x[1]
+  E <- x[2]
+  I_a <- x[3]
+  I_p <- x[4]
+  I_s <- x[5]
+  P <- x[6]
+  H_norm <- x[7]
+  H_icu <- x[8]
+  D <- x[9]
+  R <- x[10]
+  V1 <- x[11]
+  V2 <- x[12]
+  ## now define parameters 
+  h_0 <- params["h_0"]
+  h_1 <- params["h_1"]
+  v_1_1 <- params["v_1_1"]
+  v_1_2 <- params["v_1_2"]
+  # v_2_1 <- params["v_2_1"]
+  # v_2_2 <- params["v_2_2"]
+  ## Reduce contact rate over time because of interventions
+  sigma <- if_else(t <= 7,
+                    sigma_alpha,
+                    sigma_delta)
+  beta_t <- if_else(t <= intervention_period[1],
+                    beta0 * contact_reduction[1],
+                    if_else(t <= intervention_period[2],
+                    beta0 * contact_reduction_2,
+                    if_else(t <= intervention_period[3],
+                    beta0 * contact_reduction_3,
+                    if_else(t <= intervention_period[4],
+                    beta0 * contact_reduction[4],
+                    beta0 *contact_reduction[5]))))
+  v_1_t <- if_else(t <= 45,
+                   v_1_1,
+                   if_else(t <= 108,
+                   v_1_2,
+                   0))
+  v_2_t <- if_else(t <= 45,
+                   v_2_1,
+                   if_else(t <= 108,
+                   v_2_2,
+                   0))
+  ## now code the model equations
+  dSdt <- -((beta_t*I_a+beta_t*I_p+0.6*beta_t*I_s+0.1*beta_t*P)/(N-D))*S - v_1_t*S
+  
+  dEdt <- ((beta_t*I_a+beta_t*I_p+0.6*beta_t*I_s+0.1*beta_t*P)/(N-D))*S+
+    sigma*((beta_t*I_a+beta_t*I_p+0.6*beta_t*I_s+0.1*beta_t*P)/(N-D))*V1-(1/5.5)*E
+  dV1dt <- v_1_t*S-sigma*((beta_t*I_a+beta_t*I_p+0.6*beta_t*I_s+0.1*beta_t*P)/(N-D))*V1-v_2_t*V2
+  dV2dt <- v_2_t*V2
+  dI_adt <- (1-0.69)*(1/5.5)*E-(1/6)*I_a
+  dI_pdt <- 0.69*(1/5.5)*E-(1/2)*I_p
+  dI_sdt <- (1-eta_0)*(1/2)*I_p-(1/7)*I_s
+  dPdt <- eta_0*(1/6)*I_a+eta_0*(1/2)*I_p+eta_1*(1/7)*I_s-h_0*gamma_pos_1*P-(1-h_0)*gamma_pos_2*P
+  dH_normdt <- h_0*gamma_pos_1*P+(1-delta)*gamma_icu*H_icu-
+    (1-h_1)*gamma_norm_2*H_norm-h_1*gamma_norm_1*H_norm
+  dH_icudt <- h_1*gamma_norm_1*H_norm-gamma_icu*H_icu
+  dDdt <- delta*gamma_icu*H_icu
+  dRdt <- (1-eta_0)*(1/6)*I_a+(1-eta_1)*(1/7)*I_s+(1-h_0)*gamma_pos_2*P+(1-h_1)*gamma_norm_2*H_norm
+  ## return result as a list!
+  list(c(dSdt,dEdt,dI_adt,dI_pdt,dI_sdt,dPdt,dH_normdt,dH_icudt,dDdt,dRdt,dV1dt,dV2dt))
+}
+
+
+
+#Model with fitted parameters
+
+times <-seq(from=0,to=230,by=1)# returns a sequence
+
+out_4_hosp_3 <-as.data.table(
+  ode(
+    func=model,
+    y=xstart,
+    times=times,
+    parms=Opt_par_hosp_fitted))
+
+#Model validation
+data_model <- out_4_hosp_3[,c("time", "H_icu","H_norm","V1","V2")]
+data_real <- dt_hosp_fourth[,c("time", "covid_icu","covid_ward")]
+data_validation_3 <- merge(data_model, data_real,by="time", all.x=T)
+data_validation_V_3<- merge(data_model, dt_vacc_fourth, by="time",all.x=T)
+
+data_validation_3$Scenario <- rep("Extreme scenario", length(data_validation_3$time))
+data_validation_V_3$Scenario <- rep("Extreme scenario", length(data_validation_V_3$time))
+
+
+```
+
+
+
+# Results
+
+```{r, error=FALSE, fig.asp=1, message=FALSE, warning=FALSE, out.width='.55\\linewidth'}
+
+data_validation$Scenario <- rep("Fitted", length(data_validation$time))
+data_validation_p <- data_validation
+data_validation_p$time <- data_validation_p$time + rep(518, length(data_validation_p$time))
+
+data_validation_V$Scenario <- rep("Fitted", length(data_validation_V$time))
+
+
+data_validation_1_a <- data_validation_1[109:231,]
+data_validation_1_a_p <- data_validation_1[109:231,]
+data_validation_1_a_p$time <- data_validation_1_a_p$time + rep(518, length(data_validation_1_a_p$time))
+
+data_validation_2_a <- data_validation_2[109:231,]
+data_validation_2_a_p <- data_validation_2[109:231,]
+data_validation_2_a_p$time <- data_validation_2_a_p$time + rep(518, length(data_validation_2_a_p$time))
+
+data_validation_3_a<- data_validation_3[109:231,]
+data_validation_3_a_p <- data_validation_3[109:231,]
+data_validation_3_a_p$time <- data_validation_3_a_p$time + rep(518, length(data_validation_3_a_p$time))
+
+dt_validation_all_scenarios <- rbind(data_validation,
+                                     data_validation_1_a,
+                                     data_validation_2_a,
+                                     data_validation_3_a)
+                                  
+dt_validation_V_all_scenarios <- rbind(data_validation_V,
+                                       data_validation_V_1,
+                                       data_validation_V_2,
+                                       data_validation_V_3)
+
+dt_validation_all_scenarios_h <- rbind(data_validation_p,
+                                     data_validation_1_a_p,
+                                     data_validation_2_a_p,
+                                     data_validation_3_a_p)
+                                  
+```
+
+
+
+
+
+
+```{r, error=FALSE, fig.asp=1, message=FALSE, warning=FALSE, out.width='.55\\linewidth'}
+
+colors <- c("Data"="red", "Extreme scenario"="indianred2", "Severe scenario"="lightslateblue",
+            "Optimal scenario"="aquamarine3", "Fitted"="black") 
+
+h_icu <- ggplot(dt_validation_all_scenarios, aes(x=time))+
+  geom_point(aes(y=covid_icu,color="Data"))+
+  geom_line(aes(y=H_icu,color=Scenario), size=0.8)+
+  labs(x = "days since 2021/06/30",
+       y = "COVID-19 patients",
+       color = "Legend")+
+  geom_vline(xintercept = 107, color="red", linetype="dashed")+
+  scale_color_manual(values = colors)+
+  annotate(geom = "text", label="Fitted Model", x=50, y=250, size=5)+
+  annotate(geom = "text", label="Predictions", x=160, y=250, size=5)+
+  annotate(geom = "text", label="Extreme", x=225, y=200, color="indianred2", size=5)+
+  annotate(geom = "text", label="Optimal", x=225, y=10, color="aquamarine3", size=5)+
+  annotate(geom = "text", label="Severe", x=225, y=100, color="lightslateblue", size=5)+
+  theme(legend.position = "none",
+        axis.title=element_text(size=15), axis.text = element_text(size=15),
+        axis.title.y = element_text(margin = margin(t = 0, r = 5, b = 0, l = 0)),
+        axis.title.x = element_text(margin = margin(t = 5, r = 0, b = 0, l = 0)),
+        legend.title = element_blank(),
+        legend.text = element_text(size=15),
+        strip.text = element_text(size=15),
+        panel.background = element_rect(fill = "white",colour = "black", size = 0.3),
+        panel.grid.major = element_line(linetype = 'solid',colour = "grey90",size=0.35),
+        panel.grid.minor = element_line(linetype = 'solid',colour = "grey90",size=0.35))
+
+
+h_icu
+
+```
+
+
+```{r echo=FALSE, error=FALSE, fig.asp=1, message=FALSE, warning=FALSE, out.width='.55\\linewidth'}
+
+h_norm <- ggplot(dt_validation_all_scenarios, aes(x=time))+
+  geom_point(aes(y=covid_ward,color="Data"))+
+  geom_line(aes(y=H_norm,color=Scenario), size=0.8)+
+  labs(x = "days since 2021/06/30",
+       y = "COVID-19 patients",
+       color = "Legend")+
+  geom_vline(xintercept = 107, color="red", linetype="dashed")+
+  scale_color_manual(values = colors)+
+  annotate(geom = "text", label="Fitted Model", x=50, y=350, size=5)+
+  annotate(geom = "text", label="Predictions", x=160, y=350, size=5)+
+  annotate(geom = "text", label="Extreme", x=225, y=280, color="indianred2", size=5)+
+  annotate(geom = "text", label="Optimal", x=225, y=12, color="aquamarine3", size=5)+
+  annotate(geom = "text", label="Severe", x=225, y=135, color="lightslateblue", size=5)+
+  theme(legend.position = "none",
+        axis.title=element_text(size=15), axis.text = element_text(size=15),
+        axis.title.y = element_text(margin = margin(t = 0, r = 5, b = 0, l = 0)),
+        axis.title.x = element_text(margin = margin(t = 5, r = 0, b = 0, l = 0)),
+        legend.title = element_blank(),
+        legend.text = element_text(size=15),
+        strip.text = element_text(size=15),
+        panel.background = element_rect(fill = "white",colour = "black", size = 0.3),
+        panel.grid.major = element_line(linetype = 'solid',colour = "grey90",size=0.35),
+        panel.grid.minor = element_line(linetype = 'solid',colour = "grey90",size=0.35))
+
+h_norm
+
+```
+
+
+
+
+
+
+
+
+
+```{r}
+
+colors <- c("Data"="red", "Extreme scenario"="indianred2", "Severe scenario"="lightslateblue",
+            "Optimal scenario"="aquamarine3", "Fitted"="black") 
+
+
+out_1_h <- out_1_hosp
+out_2_h <- out_2_hosp
+out_2_h$time <- out_2_h$time + rep(138, length(out_2_h$time))
+out_3_h <- out_3_hosp
+out_3_h$time <- out_3_h$time + rep(383, length(out_3_h$time))
+
+
+h_summary_icu <- ggplot(dt_validation_all_scenarios_h, aes(x=time))+
+  geom_point(data=dt_hosp[1:604,],aes(y=covid_icu,color="Data"),size=2)+
+  geom_line(aes(y=H_icu,color=Scenario), size=1.2)+
+  #ggtitle("Number of COVID-19 patients in ICU")+
+  labs(x = "days since 2020/01/29",
+       y = "COVID-19 patients",
+       color = "Legend")+
+  geom_vline(xintercept = 625, color="red", linetype="dashed")+
+  scale_color_manual(values = colors)+
+  annotate(geom = "text", label="Fitted Model", x=200, y=250, size=5)+
+  annotate(geom = "text", label="Predictions", x=700, y=250, size=5)+
+  annotate(geom = "text", label="Extreme", x=765, y=200, color="indianred2", size=5)+
+  annotate(geom = "text", label="Optimal", x=765, y=10, color="aquamarine3", size=5)+
+  annotate(geom = "text", label="Severe", x=765, y=100, color="lightslateblue", size=5)+
+  theme(legend.position = "none")+
+  geom_line(data=out_1_h, aes(y=H_icu), size=1.2)+
+  geom_line(data=out_2_h, aes(y=H_icu), size=1.2)+
+  geom_line(data=out_3_h, aes(y=H_icu), size=1.2)+
+  theme(legend.position = "none",
+        axis.title=element_text(size=15), axis.text = element_text(size=15),
+        axis.title.y = element_text(margin = margin(t = 0, r = 5, b = 0, l = 0)),
+        axis.title.x = element_text(margin = margin(t = 5, r = 0, b = 0, l = 0)),
+        legend.title = element_blank(),
+        legend.text = element_text(size=15),
+        strip.text = element_text(size=15),
+        panel.background = element_rect(fill = "white",colour = "black", size = 0.3),
+        panel.grid.major = element_line(linetype = 'solid',colour = "grey90",size=0.35),
+        panel.grid.minor = element_line(linetype = 'solid',colour = "grey90",size=0.35))
+
+
+h_summary_icu
+```
+
+
+```{r echo=FALSE, error=FALSE, fig.asp=1, message=FALSE, warning=FALSE, out.width='.55\\linewidth'}
+
+
+h_summary_norm <- ggplot(dt_validation_all_scenarios_h, aes(x=time))+
+  geom_point(data=dt_hosp[1:604,],aes(y=covid_ward,color="Data"), size=2)+
+  geom_line(aes(y=H_norm,color=Scenario), size=1.2)+
+  labs(x = "days since 2020/01/29",
+       y = "COVID-19 patients",
+       color = "Legend")+
+  geom_vline(xintercept = 625, color="red", linetype="dashed")+
+  scale_color_manual(values = colors)+
+  annotate(geom = "text", label="Fitted Model", x=200, y=500, size=5)+
+  annotate(geom = "text", label="Predictions", x=700, y=500, size=5)+
+  annotate(geom = "text", label="Extreme", x=765, y=280, color="indianred2", size=5)+
+  annotate(geom = "text", label="Optimal", x=765, y=10, color="aquamarine3", size=5)+
+  annotate(geom = "text", label="Severe", x=765, y=140, color="lightslateblue", size=5)+
+  theme(legend.position = "none")+
+  geom_line(data=out_1_h, aes(y=H_norm), size=1.2)+
+  geom_line(data=out_2_h, aes(y=H_norm), size=1.2)+
+  geom_line(data=out_3_h, aes(y=H_norm), size=1.2)+
+  theme(legend.position = "none",
+        axis.title=element_text(size=15), axis.text = element_text(size=15),
+        axis.title.y = element_text(margin = margin(t = 0, r = 5, b = 0, l = 0)),
+        axis.title.x = element_text(margin = margin(t = 5, r = 0, b = 0, l = 0)),
+        legend.title = element_blank(),
+        legend.text = element_text(size=15),
+        strip.text = element_text(size=15),
+        panel.background = element_rect(fill = "white",colour = "black", size = 0.3),
+        panel.grid.major = element_line(linetype = 'solid',colour = "grey90",size=0.35),
+        panel.grid.minor = element_line(linetype = 'solid',colour = "grey90",size=0.35))
+
+h_summary_norm
+
+```
+
+
+
+
